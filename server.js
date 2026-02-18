@@ -8,6 +8,13 @@ import { prisma } from "./app/prisma.js"
 
 import authRoutes from "./app/auth/auth.routes.js"
 import userRoutes from "./app/user/user.routes.js"
+import configRoutes from "./app/config/config.routes.js"
+import generateRoutes from "./app/generate/generate.routes.js"
+import mediaRoutes from "./app/media/media.routes.js"
+import menuRoutes from "./app/menu/menu.routes.js"
+import menuStructureRoutes from "./app/menu/menuStructure.routes.js"
+import casesRoutes from "./app/cases/cases.routes.js"
+import casesStructureRoutes from "./app/cases/casesStructure.routes.js"
 
 import cors from "cors"
 
@@ -15,7 +22,13 @@ dotenv.config()
 
 const app = express()
 
-app.use(cors())
+// Настройка CORS для работы с фронтендом
+app.use(cors({
+  origin: ['http://localhost:3000', 'http://localhost:5173'], // Разрешаем запросы с фронтенда
+  credentials: true, // Разрешаем отправку cookies и авторизационных заголовков
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+}))
 
 async function main() {
   if (process.env.NODE_ENV === "development") app.use(morgan("dev"))
@@ -25,9 +38,17 @@ async function main() {
   const __dirname = path.resolve()
 
   app.use("/uploads", express.static(path.join(__dirname, "/uploads/")))
+  app.use("/config.json", express.static(path.join(__dirname, "/public/config.json")))
 
   app.use("/api/auth", authRoutes)
   app.use("/api/users", userRoutes)
+  app.use("/api/config", configRoutes)
+  app.use("/api/admin", generateRoutes)
+  app.use("/api/admin/media", mediaRoutes)
+  app.use("/api/menu", menuRoutes)
+  app.use("/api/menuStructure", menuStructureRoutes)
+  app.use("/api/cases", casesRoutes)
+  app.use("/api/casesStructure", casesStructureRoutes)
 
   app.use(notFound)
   app.use(errorHandler)
@@ -59,7 +80,18 @@ async function main() {
 }
 
 main().catch(async (e) => {
-  console.error(e)
+  console.error('❌ Критическая ошибка при запуске сервера:', e)
   await prisma.$disconnect()
   process.exit(1)
+})
+
+// Обработка необработанных ошибок
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('❌ Unhandled Rejection at:', promise, 'reason:', reason)
+  // Не завершаем процесс, чтобы сервер продолжал работать
+})
+
+process.on('uncaughtException', (error) => {
+  console.error('❌ Uncaught Exception:', error)
+  // Не завершаем процесс, чтобы сервер продолжал работать
 })

@@ -10,8 +10,8 @@ generator client {
 }
 
 datasource db {
-  provider = "postgresql"
-  // provider = "mongodb"
+  // provider = "postgresql"
+  provider = "mongodb"
   url      = env("DATABASE_URL")
 }
 
@@ -26,8 +26,8 @@ type UserInformation {
 }
 
 model User {
-  id              Int              @id @default(autoincrement()) // postgresql
-  // id        String   @id @default(auto()) @map("_id") @db.ObjectId // mongodb
+  // id              Int              @id @default(autoincrement()) // postgresql
+  id        String   @id @default(auto()) @map("_id") @db.ObjectId // mongodb
   createdAt       DateTime         @default(now()) @map("created_at")
   updatedAt       DateTime         @updatedAt @map("updated_at")
   email           String           @unique
@@ -36,4 +36,102 @@ model User {
   password        String
   role            Role             @default(USER)
   userInformation UserInformation?
+}
+
+model Config {
+  id            String   @id @default(auto()) @map("_id") @db.ObjectId
+  backendApiUrl String?
+  frontendUrl   String?
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+  
+  @@map("configs")
+}
+
+model Cases {
+  id        String   @id @default(auto()) @map("_id") @db.ObjectId
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+  nazvanie String?
+  opisanie String?
+  additionalBlocks Json?
+  
+  @@map("casess")
+}
+
+
+
+
+
+
+model News {
+  id        String   @id @default(auto()) @map("_id") @db.ObjectId
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+  nazvanie_novosti String?
+  glavnaya_kartinka_novosti String?
+  
+  @@map("newss")
+}
+
+model MenuItem {
+  id        String   @id @default(auto()) @map("_id") @db.ObjectId
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+  label     String
+  url       String
+  order     Int      @default(0)
+  isVisible Boolean  @default(true)
+  icon      String?
+  iconType  String?  // 'library' | 'upload'
+  isSystem  Boolean  @default(false)
+  
+  @@map("menu_items")
+  @@index([order])
+}
+
+model DynamicPage {
+  id        String   @id @default(auto()) @map("_id") @db.ObjectId
+  slug      String   @unique
+  title     String?
+  blocks    Json?
+  structure Json?
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+  
+  @@map("dynamic_pages")
+}
+
+model CasesStructure {
+  id        String   @id @default(auto()) @map("_id") @db.ObjectId
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+  fields    Json?
+  
+  @@map("cases_structures")
+}
+
+model MenuStructure {
+  id        String   @id @default(auto()) @map("_id") @db.ObjectId
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+  fields    Json?
+  
+  @@map("menu_structures")
+}
+
+model Menu {
+  id        String   @id @default(auto()) @map("_id") @db.ObjectId
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+  label String
+  url String
+  order Int?
+  is_visible Boolean?
+  icon String?
+  icon_type String?
+  is_system Boolean?
+  additionalBlocks Json?
+  
+  @@map("menus")
 }

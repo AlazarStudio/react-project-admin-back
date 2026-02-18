@@ -1,0 +1,17 @@
+{
+  "ignore": [
+    "node_modules/**/*",
+    "generated/**/*",
+    "prisma/migrations/**/*",
+    ".prisma/**/*",
+    "**/.prisma/**/*"
+  ],
+  "watch": [
+    "app",
+    "server.js",
+    "prisma/schema.prisma"
+  ],
+  "ext": "js,json,prisma",
+  "delay": 3000,
+  "verbose": false
+}
