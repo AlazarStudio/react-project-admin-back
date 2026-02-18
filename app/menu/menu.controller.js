@@ -22,7 +22,23 @@ function isNonEmptyString(value) {
 }
 
 function normalizeMenuData(payload, { requireLabelAndUrl = false } = {}) {
-  const data = sanitizeCreateData(payload)
+  const input = sanitizeCreateData(payload)
+  const data = { ...input }
+
+  // Backward compatibility: accept camelCase fields from frontend.
+  if (input.isVisible !== undefined && input.is_visible === undefined) {
+    data.is_visible = input.isVisible
+  }
+  if (input.iconType !== undefined && input.icon_type === undefined) {
+    data.icon_type = input.iconType
+  }
+  if (input.isSystem !== undefined && input.is_system === undefined) {
+    data.is_system = input.isSystem
+  }
+
+  delete data.isVisible
+  delete data.iconType
+  delete data.isSystem
 
   if (data.label !== undefined) {
     if (!isNonEmptyString(data.label)) {
