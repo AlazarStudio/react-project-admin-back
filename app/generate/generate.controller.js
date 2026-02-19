@@ -38,6 +38,54 @@ function resourceNameToSlug(resourceName = "") {
     .toLowerCase()
 }
 
+const DYNAMIC_PAGES_COLLECTION = "dynamic_pages"
+
+function normalizeDynamicPageDoc(doc) {
+  if (!doc || typeof doc !== "object") return null
+  const page = { ...doc }
+  if (page._id && typeof page._id === "object" && page._id.$oid) {
+    page.id = page._id.$oid
+    delete page._id
+  }
+  return page
+}
+
+async function findDynamicPageBySlug(slug) {
+  const result = await prisma.$runCommandRaw({
+    find: DYNAMIC_PAGES_COLLECTION,
+    filter: { slug: String(slug) },
+    limit: 1,
+  })
+  const doc = result?.cursor?.firstBatch?.[0]
+  return normalizeDynamicPageDoc(doc)
+}
+
+async function upsertDynamicPage({ slug, title, blocks = [], structure = {} }) {
+  const now = new Date()
+  await prisma.$runCommandRaw({
+    update: DYNAMIC_PAGES_COLLECTION,
+    updates: [
+      {
+        q: { slug: String(slug) },
+        u: {
+          $set: {
+            slug: String(slug),
+            title: title || String(slug),
+            blocks: blocks || [],
+            structure: structure || {},
+            updated_at: now,
+          },
+          $setOnInsert: { created_at: now },
+        },
+        upsert: true,
+        multi: false,
+      },
+    ],
+  })
+
+  return findDynamicPageBySlug(slug)
+}
+
 // @desc    Generate resource (model, controller, routes)
 // @route   POST /api/admin/generate-resource
 // @access  Private (Admin only)
@@ -186,18 +234,11 @@ export const generateResource = asyncHandler(async (req, res) => {
     }
 
     if (dynamicSlug) {
-      await prisma.dynamicPage.upsert({
-        where: { slug: dynamicSlug },
-        update: {
-          title: dynamicTitle,
-          structure: dynamicStructure,
-        },
-        create: {
-          slug: dynamicSlug,
-          title: dynamicTitle,
-          blocks: [],
-          structure: dynamicStructure,
-        },
+      await upsertDynamicPage({
+        slug: dynamicSlug,
+        title: dynamicTitle,
+        blocks: [],
+        structure: dynamicStructure,
       })
       console.log(`✅ [4.5/6] DynamicPage upsert выполнен для slug: ${dynamicSlug}`)
     } else {
@@ -316,20 +357,16 @@ export const generateResource = asyncHandler(async (req, res) => {
 export const getDynamicPage = asyncHandler(async (req, res) => {
   const { slug } = req.params
 
-  let page = await prisma.dynamicPage.findUnique({
-    where: { slug }
-  })
+  let page = await findDynamicPageBySlug(slug)
 
   if (!page) {
     // Автосоздание страницы для обратной совместимости:
     // если ресурс уже сгенерирован ранее без DynamicPage, не возвращаем 404.
-    page = await prisma.dynamicPage.create({
-      data: {
-        slug,
-        title: slug,
-        blocks: [],
-        structure: { fields: [] },
-      },
+    page = await upsertDynamicPage({
+      slug,
+      title: slug,
+      blocks: [],
+      structure: { fields: [] },
     })
     console.log(`ℹ️ DynamicPage не найден, создан автоматически: ${slug}`)
   }
@@ -344,31 +381,23 @@ export const updateDynamicPage = asyncHandler(async (req, res) => {
   const { slug } = req.params
   const { title, blocks, structure } = req.body
 
-  let page = await prisma.dynamicPage.findUnique({
-    where: { slug }
-  })
+  let page = await findDynamicPageBySlug(slug)
 
   if (!page) {
-    // Если страница не существует, создаем ее
-    page = await prisma.dynamicPage.create({
-      data: {
-        slug,
-        title: title || slug,
-        blocks: blocks || [],
-        structure: structure || {}
-      }
+    page = await upsertDynamicPage({
+      slug,
+      title: title || slug,
+      blocks: blocks || [],
+      structure: structure || {},
     })
     return res.status(201).json(page)
   }
 
-  // Обновляем существующую страницу
-  const updatedPage = await prisma.dynamicPage.update({
-    where: { slug },
-    data: {
-      ...(title !== undefined && { title }),
-      ...(blocks !== undefined && { blocks }),
-      ...(structure !== undefined && { structure })
-    }
+  const updatedPage = await upsertDynamicPage({
+    slug,
+    title: title !== undefined ? title : page.title,
+    blocks: blocks !== undefined ? blocks : page.blocks,
+    structure: structure !== undefined ? structure : page.structure,
   })
 
   res.json(updatedPage)
@@ -382,9 +411,7 @@ export const createDynamicPage = asyncHandler(async (req, res) => {
   const { title, blocks, structure } = req.body
 
   // Проверяем, существует ли уже страница с таким slug
-  const existing = await prisma.dynamicPage.findUnique({
-    where: { slug }
-  })
+  const existing = await findDynamicPageBySlug(slug)
 
   if (existing) {
     return res.status(400).json({ 
@@ -392,13 +419,11 @@ export const createDynamicPage = asyncHandler(async (req, res) => {
     })
   }
 
-  const page = await prisma.dynamicPage.create({
-    data: {
-      slug,
-      title: title || slug,
-      blocks: blocks || [],
-      structure: structure || {}
-    }
+  const page = await upsertDynamicPage({
+    slug,
+    title: title || slug,
+    blocks: blocks || [],
+    structure: structure || {},
   })
 
   res.status(201).json(page)

@@ -13,7 +13,11 @@ export function generatePrismaModel(resourceName, fields) {
   const modelName = capitalizeFirst(resourceName)
   
   // Преобразуем поля в формат Prisma
-  const prismaFields = fields.map(field => {
+  // Поле isPublished всегда добавляется как системное (Boolean @default(false)),
+  // поэтому одноименные пользовательские поля отбрасываем, чтобы избежать конфликтов.
+  const prismaFields = fields
+    .filter(field => camelToSnake(field.name) !== 'is_published')
+    .map(field => {
     const fieldName = camelToSnake(field.name)
     let prismaField = `  ${fieldName}`
     
@@ -46,14 +50,15 @@ export function generatePrismaModel(resourceName, fields) {
       prismaField += '?'
     }
     
-    return prismaField
-  })
+      return prismaField
+    })
   
   // Стандартные поля
   const standardFields = [
     '  id        String   @id @default(auto()) @map("_id") @db.ObjectId',
     '  createdAt DateTime @default(now()) @map("created_at")',
-    '  updatedAt DateTime @updatedAt @map("updated_at")'
+    '  updatedAt DateTime @updatedAt @map("updated_at")',
+    '  isPublished Boolean @default(false)'
   ]
   
   // Автоматически добавляем поле additionalBlocks для дополнительных блоков
@@ -123,13 +128,140 @@ function getModelClient(prismaClient, baseName) {
   for (const key of candidates) {
     if (prismaClient[key]) return prismaClient[key]
   }
-  throw new Error(\`Prisma model client not found for resource "\${baseName}"\`)
+  return null
 }
 
 function sanitizeCreateData(payload) {
-  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return {}
-  const { id, createdAt, updatedAt, ...rest } = payload
-  return rest
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return { isPublished: false }
+  }
+  const { id, createdAt, updatedAt, isPublished, ...rest } = payload
+  const keyAliases = {
+    isVisible: "is_visible",
+    iconType: "icon_type",
+    isSystem: "is_system",
+  }
+  const normalizedRest = Object.fromEntries(
+    Object.entries(rest).map(([key, value]) => [keyAliases[key] || key, value])
+  )
+  return {
+    ...normalizedRest,
+    isPublished: typeof isPublished === "boolean" ? isPublished : false,
+  }
+}
+
+const COLLECTION_NAME = "${routeName}s"
+
+function asObjectIdFilter(id) {
+  return { _id: { $oid: String(id) } }
+}
+
+function normalizeMongoDoc(doc) {
+  if (!doc || typeof doc !== "object") return null
+  const mapped = { ...doc }
+  if (mapped._id && typeof mapped._id === "object" && mapped._id.$oid) {
+    mapped.id = mapped._id.$oid
+    delete mapped._id
+  }
+  return mapped
+}
+
+async function ensureMongoTimestamps() {
+  await prisma.$runCommandRaw({
+    update: COLLECTION_NAME,
+    updates: [
+      {
+        q: { created_at: { $type: "string" } },
+        u: [{ $set: { created_at: { $toDate: "$created_at" } } }],
+        multi: true
+      },
+      {
+        q: { updated_at: { $type: "string" } },
+        u: [{ $set: { updated_at: { $toDate: "$updated_at" } } }],
+        multi: true
+      },
+      {
+        q: { created_at: { $exists: false } },
+        u: [{ $set: { created_at: "$$NOW" } }],
+        multi: true
+      },
+      {
+        q: { updated_at: { $exists: false } },
+        u: [{ $set: { updated_at: "$$NOW" } }],
+        multi: true
+      }
+    ]
+  })
+}
+
+async function findManyViaMongo() {
+  await ensureMongoTimestamps()
+  const result = await prisma.$runCommandRaw({
+    find: COLLECTION_NAME,
+    filter: {},
+    sort: { created_at: -1 }
+  })
+  return (result?.cursor?.firstBatch || []).map(normalizeMongoDoc)
+}
+
+async function findOneViaMongo(id) {
+  const result = await prisma.$runCommandRaw({
+    find: COLLECTION_NAME,
+    filter: asObjectIdFilter(id),
+    limit: 1
+  })
+  return normalizeMongoDoc(result?.cursor?.firstBatch?.[0])
+}
+
+async function createViaMongo(payload) {
+  const data = sanitizeCreateData(payload)
+  await prisma.$runCommandRaw({
+    insert: COLLECTION_NAME,
+    documents: [{
+      ...data
+    }]
+  })
+  await ensureMongoTimestamps()
+  const result = await prisma.$runCommandRaw({
+    find: COLLECTION_NAME,
+    filter: {},
+    sort: { created_at: -1 },
+    limit: 1
+  })
+  return normalizeMongoDoc(result?.cursor?.firstBatch?.[0])
+}
+
+async function replaceCollectionViaMongo(items) {
+  await prisma.$runCommandRaw({
+    delete: COLLECTION_NAME,
+    deletes: [{ q: {}, limit: 0 }]
+  })
+
+  const docs = (items || []).map((item) => {
+    return {
+      ...sanitizeCreateData(item),
+    }
+  })
+
+  if (docs.length > 0) {
+    await prisma.$runCommandRaw({
+      insert: COLLECTION_NAME,
+      documents: docs
+    })
+  }
+
+  await ensureMongoTimestamps()
+  return findManyViaMongo()
+}
+
+async function deleteViaMongo(id) {
+  await prisma.$runCommandRaw({
+    delete: COLLECTION_NAME,
+    deletes: [{
+      q: asObjectIdFilter(id),
+      limit: 1
+    }]
+  })
 }
 
 // @desc    Get all ${routeName} (bulk collection)
@@ -137,11 +269,13 @@ function sanitizeCreateData(payload) {
 // @access  Private/Public
 export const get${modelName}s = asyncHandler(async (req, res) => {
   const model = getModelClient(prisma, "${routeName}")
-  const items = await model.findMany({
-    orderBy: {
-      createdAt: "desc"
-    }
-  })
+  const items = model
+    ? await model.findMany({
+      orderBy: {
+        createdAt: "desc"
+      }
+    })
+    : await findManyViaMongo()
 
   res.json({ items })
 })
@@ -151,11 +285,13 @@ export const get${modelName}s = asyncHandler(async (req, res) => {
 // @access  Private
 export const get${modelName}ById = asyncHandler(async (req, res) => {
   const model = getModelClient(prisma, "${routeName}")
-  const item = await model.findUnique({
-    where: {
-      id: req.params.id
-    }
-  })
+  const item = model
+    ? await model.findUnique({
+      where: {
+        id: req.params.id
+      }
+    })
+    : await findOneViaMongo(req.params.id)
 
   if (!item) {
     res.status(404)
@@ -170,9 +306,11 @@ export const get${modelName}ById = asyncHandler(async (req, res) => {
 // @access  Private
 export const create${modelName} = asyncHandler(async (req, res) => {
   const model = getModelClient(prisma, "${routeName}")
-  const item = await model.create({
-    data: sanitizeCreateData(req.body)
-  })
+  const item = model
+    ? await model.create({
+      data: sanitizeCreateData(req.body)
+    })
+    : await createViaMongo(req.body)
 
   res.status(201).json(item)
 })
@@ -181,7 +319,6 @@ export const create${modelName} = asyncHandler(async (req, res) => {
 // @route   PUT /api/${routeName}
 // @access  Private
 export const update${modelName} = asyncHandler(async (req, res) => {
-  const model = getModelClient(prisma, "${routeName}")
   const { items } = req.body
 
   if (!Array.isArray(items)) {
@@ -189,15 +326,16 @@ export const update${modelName} = asyncHandler(async (req, res) => {
     throw new Error("items must be an array")
   }
 
-  await model.deleteMany({})
-
-  const createdItems = await Promise.all(
-    items.map((item) =>
-      model.create({
-        data: sanitizeCreateData(item)
-      })
-    )
-  )
+  const model = getModelClient(prisma, "${routeName}")
+  const createdItems = model
+    ? (await model.deleteMany({}), await Promise.all(
+      items.map((item) =>
+        model.create({
+          data: sanitizeCreateData(item)
+        })
+      )
+    ))
+    : await replaceCollectionViaMongo(items)
 
   res.json({ items: createdItems })
 })
@@ -207,22 +345,28 @@ export const update${modelName} = asyncHandler(async (req, res) => {
 // @access  Private
 export const delete${modelName} = asyncHandler(async (req, res) => {
   const model = getModelClient(prisma, "${routeName}")
-  const item = await model.findUnique({
-    where: {
-      id: req.params.id
-    }
-  })
+  const item = model
+    ? await model.findUnique({
+      where: {
+        id: req.params.id
+      }
+    })
+    : await findOneViaMongo(req.params.id)
 
   if (!item) {
     res.status(404)
     throw new Error("${modelName} not found")
   }
 
-  await model.delete({
-    where: {
-      id: req.params.id
-    }
-  })
+  if (model) {
+    await model.delete({
+      where: {
+        id: req.params.id
+      }
+    })
+  } else {
+    await deleteViaMongo(req.params.id)
+  }
 
   res.json({ message: "${modelName} deleted" })
 })
@@ -237,6 +381,25 @@ export const delete${modelName} = asyncHandler(async (req, res) => {
     
     return `import asyncHandler from "express-async-handler"
 import { prisma } from "../prisma.js"
+
+function sanitizeCreateData(payload) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return { isPublished: false }
+  }
+  const { id, createdAt, updatedAt, isPublished, ...rest } = payload
+  const keyAliases = {
+    isVisible: "is_visible",
+    iconType: "icon_type",
+    isSystem: "is_system",
+  }
+  const normalizedRest = Object.fromEntries(
+    Object.entries(rest).map(([key, value]) => [keyAliases[key] || key, value])
+  )
+  return {
+    ...normalizedRest,
+    isPublished: typeof isPublished === "boolean" ? isPublished : false,
+  }
+}
 
 // @desc    Get ${routeName} ${fieldName}
 // @route   GET /api/${routeName}
@@ -281,7 +444,7 @@ export const get${modelName}ById = asyncHandler(async (req, res) => {
 // @access  Private
 export const create${modelName} = asyncHandler(async (req, res) => {
   const ${varName} = await prisma.${varName}.create({
-    data: req.body
+    data: sanitizeCreateData(req.body)
   })
 
   res.status(201).json(${varName})
@@ -353,30 +516,188 @@ export const delete${modelName} = asyncHandler(async (req, res) => {
   return `import asyncHandler from "express-async-handler"
 import { prisma } from "../prisma.js"
 
+const MODEL_KEY = "${routeName.toLowerCase()}"
+const COLLECTION_NAME = "${routeName.toLowerCase()}s"
+
+function sanitizeCreateData(payload) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return { isPublished: false }
+  }
+  const { id, createdAt, updatedAt, isPublished, ...rest } = payload
+  const keyAliases = {
+    isVisible: "is_visible",
+    iconType: "icon_type",
+    isSystem: "is_system",
+  }
+  const normalizedRest = Object.fromEntries(
+    Object.entries(rest).map(([key, value]) => [keyAliases[key] || key, value])
+  )
+  return {
+    ...normalizedRest,
+    isPublished: typeof isPublished === "boolean" ? isPublished : false,
+  }
+}
+
+function getModel() {
+  return prisma[MODEL_KEY] || null
+}
+
+function asObjectIdFilter(id) {
+  return { _id: { $oid: String(id) } }
+}
+
+function normalizeMongoDoc(doc) {
+  if (!doc || typeof doc !== "object") return null
+  const mapped = { ...doc }
+  if (mapped._id && typeof mapped._id === "object" && mapped._id.$oid) {
+    mapped.id = mapped._id.$oid
+    delete mapped._id
+  }
+  return mapped
+}
+
+async function ensureMongoTimestamps() {
+  await prisma.$runCommandRaw({
+    update: COLLECTION_NAME,
+    updates: [
+      {
+        q: { created_at: { $type: "string" } },
+        u: [{ $set: { created_at: { $toDate: "$created_at" } } }],
+        multi: true
+      },
+      {
+        q: { updated_at: { $type: "string" } },
+        u: [{ $set: { updated_at: { $toDate: "$updated_at" } } }],
+        multi: true
+      },
+      {
+        q: { created_at: { $exists: false } },
+        u: [{ $set: { created_at: "$$NOW" } }],
+        multi: true
+      },
+      {
+        q: { updated_at: { $exists: false } },
+        u: [{ $set: { updated_at: "$$NOW" } }],
+        multi: true
+      }
+    ]
+  })
+}
+
+async function findManyViaMongo(skip, take) {
+  await ensureMongoTimestamps()
+  const [listResult, countResult] = await Promise.all([
+    prisma.$runCommandRaw({
+      find: COLLECTION_NAME,
+      filter: {},
+      sort: { created_at: -1 },
+      skip,
+      limit: take
+    }),
+    prisma.$runCommandRaw({
+      count: COLLECTION_NAME,
+      query: {}
+    })
+  ])
+
+  const docs = (listResult?.cursor?.firstBatch || []).map(normalizeMongoDoc)
+  const total = Number(countResult?.n || 0)
+  return { docs, total }
+}
+
+async function findOneViaMongo(id) {
+  const result = await prisma.$runCommandRaw({
+    find: COLLECTION_NAME,
+    filter: asObjectIdFilter(id),
+    limit: 1
+  })
+  const doc = result?.cursor?.firstBatch?.[0]
+  return normalizeMongoDoc(doc)
+}
+
+async function createViaMongo(payload) {
+  const data = sanitizeCreateData(payload)
+
+  await prisma.$runCommandRaw({
+    insert: COLLECTION_NAME,
+    documents: [{
+      ...data
+    }]
+  })
+  await ensureMongoTimestamps()
+
+  const result = await prisma.$runCommandRaw({
+    find: COLLECTION_NAME,
+    filter: {},
+    sort: { created_at: -1 },
+    limit: 1
+  })
+  return normalizeMongoDoc(result?.cursor?.firstBatch?.[0])
+}
+
+async function updateViaMongo(id, payload) {
+  await prisma.$runCommandRaw({
+    update: COLLECTION_NAME,
+    updates: [{
+      q: asObjectIdFilter(id),
+      u: [{
+        $set: {
+          ...sanitizeCreateData(payload),
+          created_at: { $ifNull: ["$created_at", "$$NOW"] },
+          updated_at: "$$NOW"
+        }
+      }],
+      multi: false
+    }]
+  })
+  return findOneViaMongo(id)
+}
+
+async function deleteViaMongo(id) {
+  await prisma.$runCommandRaw({
+    delete: COLLECTION_NAME,
+    deletes: [{
+      q: asObjectIdFilter(id),
+      limit: 1
+    }]
+  })
+}
+
 // @desc    Get all ${routeName}
 // @route   GET /api/${routeName}
 // @access  Private
 export const get${modelName}s = asyncHandler(async (req, res) => {
   const { page = 1, limit = 10 } = req.query
   const skip = (parseInt(page) - 1) * parseInt(limit)
+  const take = parseInt(limit)
+  const model = getModel()
 
-  const [${routeName}, total] = await Promise.all([
-    prisma.${routeName.toLowerCase()}.findMany({
-      skip,
-      take: parseInt(limit),
-      orderBy: {
-        createdAt: "desc"
-      }
-    }),
-    prisma.${routeName.toLowerCase()}.count()
-  ])
+  let items = []
+  let total = 0
+
+  if (model) {
+    [items, total] = await Promise.all([
+      model.findMany({
+        skip,
+        take,
+        orderBy: {
+          createdAt: "desc"
+        }
+      }),
+      model.count()
+    ])
+  } else {
+    const result = await findManyViaMongo(skip, take)
+    items = result.docs
+    total = result.total
+  }
 
   res.json({
-    ${routeName},
+    ${routeName}: items,
     total,
     page: parseInt(page),
-    limit: parseInt(limit),
-    totalPages: Math.ceil(total / parseInt(limit))
+    limit: take,
+    totalPages: Math.ceil(total / take)
   })
 })
 
@@ -384,52 +705,53 @@ export const get${modelName}s = asyncHandler(async (req, res) => {
 // @route   GET /api/${routeName}/:id
 // @access  Private
 export const get${modelName}ById = asyncHandler(async (req, res) => {
-  const ${routeName} = await prisma.${routeName.toLowerCase()}.findUnique({
-    where: {
-      id: req.params.id
-    }
-  })
+  const model = getModel()
+  const item = model
+    ? await model.findUnique({ where: { id: req.params.id } })
+    : await findOneViaMongo(req.params.id)
 
-  if (!${routeName}) {
+  if (!item) {
     res.status(404)
     throw new Error("${modelName} not found")
   }
 
-  res.json(${routeName})
+  res.json(item)
 })
 
 // @desc    Create ${routeName}
 // @route   POST /api/${routeName}
 // @access  Private
 export const create${modelName} = asyncHandler(async (req, res) => {
-  const ${routeName} = await prisma.${routeName.toLowerCase()}.create({
-    data: req.body
-  })
+  const model = getModel()
+  const item = model
+    ? await model.create({ data: sanitizeCreateData(req.body) })
+    : await createViaMongo(req.body)
 
-  res.status(201).json(${routeName})
+  res.status(201).json(item)
 })
 
 // @desc    Update ${routeName}
 // @route   PUT /api/${routeName}/:id
 // @access  Private
 export const update${modelName} = asyncHandler(async (req, res) => {
-  const ${routeName} = await prisma.${routeName.toLowerCase()}.findUnique({
-    where: {
-      id: req.params.id
-    }
-  })
+  const model = getModel()
+  const existing = model
+    ? await model.findUnique({ where: { id: req.params.id } })
+    : await findOneViaMongo(req.params.id)
 
-  if (!${routeName}) {
+  if (!existing) {
     res.status(404)
     throw new Error("${modelName} not found")
   }
 
-  const updated${modelName} = await prisma.${routeName.toLowerCase()}.update({
-    where: {
-      id: req.params.id
-    },
-    data: req.body
-  })
+  const updated${modelName} = model
+    ? await model.update({
+      where: {
+        id: req.params.id
+      },
+      data: sanitizeCreateData(req.body)
+    })
+    : await updateViaMongo(req.params.id, req.body)
 
   res.json(updated${modelName})
 })
@@ -438,22 +760,21 @@ export const update${modelName} = asyncHandler(async (req, res) => {
 // @route   DELETE /api/${routeName}/:id
 // @access  Private
 export const delete${modelName} = asyncHandler(async (req, res) => {
-  const ${routeName} = await prisma.${routeName.toLowerCase()}.findUnique({
-    where: {
-      id: req.params.id
-    }
-  })
+  const model = getModel()
+  const existing = model
+    ? await model.findUnique({ where: { id: req.params.id } })
+    : await findOneViaMongo(req.params.id)
 
-  if (!${routeName}) {
+  if (!existing) {
     res.status(404)
     throw new Error("${modelName} not found")
   }
 
-  await prisma.${routeName.toLowerCase()}.delete({
-    where: {
-      id: req.params.id
-    }
-  })
+  if (model) {
+    await model.delete({ where: { id: req.params.id } })
+  } else {
+    await deleteViaMongo(req.params.id)
+  }
 
   res.json({ message: "${modelName} deleted" })
 })
@@ -467,28 +788,122 @@ export function generateStructureController(resourceName) {
   const modelName = capitalizeFirst(resourceName) + 'Structure'
   const routeName = resourceName.toLowerCase() + 'Structure'
   const prismaModelName = resourceName.toLowerCase() + 'Structure'
+  const collectionName = resourceName.toLowerCase() + '_structures'
   
   return `import asyncHandler from "express-async-handler"
 import { prisma } from "../prisma.js"
+
+const PRISMA_MODEL_KEY = "${prismaModelName}"
+const STRUCTURE_COLLECTION = "${collectionName}"
+
+function getStructureModel() {
+  return prisma[PRISMA_MODEL_KEY] || null
+}
+
+async function normalizeStructureDatesViaMongo() {
+  await prisma.$runCommandRaw({
+    update: STRUCTURE_COLLECTION,
+    updates: [
+      {
+        q: { created_at: { $type: "string" } },
+        u: [{ $set: { created_at: { $toDate: "$created_at" } } }],
+        multi: true
+      },
+      {
+        q: { updated_at: { $type: "string" } },
+        u: [{ $set: { updated_at: { $toDate: "$updated_at" } } }],
+        multi: true
+      }
+    ]
+  })
+}
+
+async function getStructureViaMongo() {
+  await prisma.$runCommandRaw({
+    update: STRUCTURE_COLLECTION,
+    updates: [
+      {
+        q: {},
+        u: [
+          {
+            $set: {
+              fields: { $ifNull: ["$fields", []] },
+              created_at: { $ifNull: ["$created_at", "$$NOW"] },
+              updated_at: "$$NOW"
+            }
+          }
+        ],
+        upsert: true,
+        multi: false
+      }
+    ]
+  })
+
+  const result = await prisma.$runCommandRaw({
+    find: STRUCTURE_COLLECTION,
+    filter: {},
+    limit: 1
+  })
+
+  const doc = result?.cursor?.firstBatch?.[0]
+  return { fields: Array.isArray(doc?.fields) ? doc.fields : [] }
+}
+
+async function updateStructureViaMongo(fields) {
+  await prisma.$runCommandRaw({
+    update: STRUCTURE_COLLECTION,
+    updates: [
+      {
+        q: {},
+        u: [
+          {
+            $set: {
+              fields: fields || [],
+              created_at: { $ifNull: ["$created_at", "$$NOW"] },
+              updated_at: "$$NOW"
+            }
+          }
+        ],
+        upsert: true,
+        multi: false
+      }
+    ]
+  })
+
+  return { fields: fields || [] }
+}
 
 // @desc    Get structure
 // @route   GET /api/${routeName}
 // @access  Private
 export const get${modelName} = asyncHandler(async (req, res) => {
-  // Ищем единственный документ или создаем его, если не существует
-  let structure = await prisma.${prismaModelName}.findFirst()
-  
-  if (!structure) {
-    // Создаем новый документ с пустым значением для fields
-    structure = await prisma.${prismaModelName}.create({
-      data: {
-        fields: []
-      }
-    })
+  await normalizeStructureDatesViaMongo()
+
+  const model = getStructureModel()
+  if (!model) {
+    const structure = await getStructureViaMongo()
+    return res.json({ fields: structure.fields || [] })
   }
 
-  // Возвращаем значение fields из единственного документа
-  res.json({ fields: structure.fields || [] })
+  try {
+    // Ищем единственный документ или создаем его, если не существует
+    let structure = await model.findFirst()
+    
+    if (!structure) {
+      // Создаем новый документ с пустым значением для fields
+      structure = await model.create({
+        data: {
+          fields: []
+        }
+      })
+    }
+
+    // Возвращаем значение fields из единственного документа
+    return res.json({ fields: structure.fields || [] })
+  } catch (error) {
+    const structure = await getStructureViaMongo()
+    return res.json({ fields: structure.fields || [] })
+  }
 })
 
 // @desc    Update structure
@@ -502,28 +917,41 @@ export const update${modelName} = asyncHandler(async (req, res) => {
     throw new Error("fields must be an array")
   }
 
-  // Ищем единственный документ или создаем его
-  let structure = await prisma.${prismaModelName}.findFirst()
-  
-  if (!structure) {
-    structure = await prisma.${prismaModelName}.create({
-      data: {
-        fields: fields || []
-      }
-    })
-  } else {
-    // Обновляем существующий документ
-    structure = await prisma.${prismaModelName}.update({
-      where: {
-        id: structure.id
-      },
-      data: {
-        fields: fields || []
-      }
-    })
+  await normalizeStructureDatesViaMongo()
+
+  const model = getStructureModel()
+  if (!model) {
+    const structure = await updateStructureViaMongo(fields)
+    return res.json({ fields: structure.fields || [] })
   }
 
-  res.json({ fields: structure.fields || [] })
+  try {
+    // Ищем единственный документ или создаем его
+    let structure = await model.findFirst()
+    
+    if (!structure) {
+      structure = await model.create({
+        data: {
+          fields: fields || []
+        }
+      })
+    } else {
+      // Обновляем существующий документ
+      structure = await model.update({
+        where: {
+          id: structure.id
+        },
+        data: {
+          fields: fields || []
+        }
+      })
+    }
+
+    return res.json({ fields: structure.fields || [] })
+  } catch (error) {
+    const structure = await updateStructureViaMongo(fields)
+    return res.json({ fields: structure.fields || [] })
+  }
 })
 `
 }
