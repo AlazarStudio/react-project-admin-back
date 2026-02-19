@@ -792,9 +792,11 @@ export function generateStructureController(resourceName) {
   
   return `import asyncHandler from "express-async-handler"
 import { prisma } from "../prisma.js"
+import { syncResourceModelFromStructure } from "../utils/structure-model-sync.js"
 
 const PRISMA_MODEL_KEY = "${prismaModelName}"
 const STRUCTURE_COLLECTION = "${collectionName}"
+const RESOURCE_NAME = "${resourceName.toLowerCase()}"
 
 function getStructureModel() {
   return prisma[PRISMA_MODEL_KEY] || null
@@ -922,7 +924,8 @@ export const update${modelName} = asyncHandler(async (req, res) => {
   const model = getStructureModel()
   if (!model) {
     const structure = await updateStructureViaMongo(fields)
-    return res.json({ fields: structure.fields || [] })
+    const syncInfo = await syncResourceModelFromStructure(RESOURCE_NAME, structure.fields || [])
+    return res.json({ fields: structure.fields || [], modelSynced: syncInfo.changed })
   }
 
   try {
@@ -947,10 +950,12 @@ export const update${modelName} = asyncHandler(async (req, res) => {
       })
     }
 
-    return res.json({ fields: structure.fields || [] })
+    const syncInfo = await syncResourceModelFromStructure(RESOURCE_NAME, structure.fields || [])
+    return res.json({ fields: structure.fields || [], modelSynced: syncInfo.changed })
   } catch (error) {
     const structure = await updateStructureViaMongo(fields)
-    return res.json({ fields: structure.fields || [] })
+    const syncInfo = await syncResourceModelFromStructure(RESOURCE_NAME, structure.fields || [])
+    return res.json({ fields: structure.fields || [], modelSynced: syncInfo.changed })
   }
 })
 `
@@ -1150,9 +1155,32 @@ function compareFields(oldFields, newFields) {
   return true
 }
 
+function ensurePrismaSchemaPreamble(schemaContent) {
+  const hasGenerator = /(^|\n)\s*generator\s+client\s*\{/m.test(schemaContent)
+  const hasDatasource = /(^|\n)\s*datasource\s+db\s*\{/m.test(schemaContent)
+
+  if (hasGenerator && hasDatasource) return schemaContent
+
+  const preamble = `generator client {
+  provider = "prisma-client-js"
+  output   = "../generated/client"
+}
+
+datasource db {
+  provider = "mongodb"
+  url      = env("DATABASE_URL")
+}
+`
+
+  const trimmed = schemaContent.trimStart()
+  if (!trimmed) return `${preamble}\n`
+  return `${preamble}\n${trimmed}`
+}
+
 export async function addModelToSchema(model) {
   const schemaPath = path.join(__dirname, '../../prisma/schema.prisma')
   let schemaContent = await fs.readFile(schemaPath, 'utf-8')
+  schemaContent = ensurePrismaSchemaPreamble(schemaContent)
   
   const modelName = model.match(/model\s+(\w+)/)?.[1]
   if (!modelName) {
@@ -1223,7 +1251,7 @@ export async function addModelToSchema(model) {
     
     if (fieldsAreSame) {
       console.log(`✅ Модель ${modelName} не изменилась, пропускаю обновление`)
-      return // Модель не изменилась, ничего не делаем
+      return false // Модель не изменилась, ничего не делаем
     }
     
     console.log(`🔄 Модель ${modelName} изменилась, обновляю...`)
@@ -1257,6 +1285,7 @@ export async function addModelToSchema(model) {
     
     await fs.writeFile(schemaPath, schemaContent, 'utf-8')
     console.log(`✅ Модель ${modelName} успешно обновлена`)
+    return true
   } else {
     console.log(`✅ Модель ${modelName} не найдена, добавляю в схему...`)
     
@@ -1265,6 +1294,7 @@ export async function addModelToSchema(model) {
     
     await fs.writeFile(schemaPath, newSchema, 'utf-8')
     console.log(`✅ Модель ${modelName} успешно добавлена в схему`)
+    return true
   }
 }
 
