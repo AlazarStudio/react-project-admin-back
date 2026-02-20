@@ -636,13 +636,27 @@ async function createViaMongo(payload) {
 }
 
 async function updateViaMongo(id, payload) {
+  const sanitized = sanitizeCreateData(payload)
+  const hasAdditionalBlocks = Object.prototype.hasOwnProperty.call(sanitized, "additionalBlocks")
+
+  if (hasAdditionalBlocks) {
+    await prisma.$runCommandRaw({
+      update: COLLECTION_NAME,
+      updates: [{
+        q: asObjectIdFilter(id),
+        u: { $unset: { additionalBlocks: "" } },
+        multi: false
+      }]
+    })
+  }
+
   await prisma.$runCommandRaw({
     update: COLLECTION_NAME,
     updates: [{
       q: asObjectIdFilter(id),
       u: [{
         $set: {
-          ...sanitizeCreateData(payload),
+          ...sanitized,
           created_at: { $ifNull: ["$created_at", "$$NOW"] },
           updated_at: "$$NOW"
         }
@@ -744,13 +758,17 @@ export const update${modelName} = asyncHandler(async (req, res) => {
     throw new Error("${modelName} not found")
   }
 
+  const hasAdditionalBlocks = Object.prototype.hasOwnProperty.call(req.body || {}, "additionalBlocks")
+
   const updated${modelName} = model
-    ? await model.update({
-      where: {
-        id: req.params.id
-      },
-      data: sanitizeCreateData(req.body)
-    })
+    ? (hasAdditionalBlocks
+      ? await updateViaMongo(req.params.id, req.body)
+      : await model.update({
+        where: {
+          id: req.params.id
+        },
+        data: sanitizeCreateData(req.body)
+      }))
     : await updateViaMongo(req.params.id, req.body)
 
   res.json(updated${modelName})
