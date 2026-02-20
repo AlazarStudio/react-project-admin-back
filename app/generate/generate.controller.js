@@ -2,6 +2,8 @@ import asyncHandler from "express-async-handler"
 import fs from 'fs/promises'
 import path from 'path'
 import { fileURLToPath } from 'url'
+import { execFile } from 'child_process'
+import { promisify } from 'util'
 import { prisma } from "../prisma.js"
 import {
   generatePrismaModel,
@@ -20,6 +22,121 @@ import {
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
+const execFileAsync = promisify(execFile)
+const rootDir = path.resolve(__dirname, "../../")
+const appDir = path.join(rootDir, "app")
+
+const CORE_APP_DIRS = new Set([
+  "auth",
+  "config",
+  "generate",
+  "media",
+  "middleware",
+  "user",
+  "utils",
+  "_empty",
+])
+const SYSTEM_COLLECTIONS = new Set(["User", "configs"])
+
+async function listGeneratedAppDirs() {
+  const entries = await fs.readdir(appDir, { withFileTypes: true })
+  return entries
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name)
+    .filter((name) => !CORE_APP_DIRS.has(name))
+}
+
+async function readFilesRecursively(baseDir, relDir = "") {
+  const currentDir = relDir ? path.join(baseDir, relDir) : baseDir
+  const entries = await fs.readdir(currentDir, { withFileTypes: true })
+  const files = []
+
+  for (const entry of entries) {
+    const relPath = relDir ? path.join(relDir, entry.name) : entry.name
+    if (entry.isDirectory()) {
+      const nested = await readFilesRecursively(baseDir, relPath)
+      files.push(...nested)
+      continue
+    }
+    const absPath = path.join(baseDir, relPath)
+    const content = await fs.readFile(absPath, "utf-8")
+    files.push({ path: relPath.replace(/\\/g, "/"), content })
+  }
+
+  return files
+}
+
+async function writeSnapshotDir(baseDir, files) {
+  for (const file of files) {
+    const relPath = String(file.path || "").replace(/\\/g, "/")
+    if (!relPath || relPath.startsWith("/") || relPath.includes("..")) {
+      throw new Error(`Invalid snapshot file path: ${relPath}`)
+    }
+    const target = path.join(baseDir, relPath)
+    await fs.mkdir(path.dirname(target), { recursive: true })
+    await fs.writeFile(target, file.content, "utf-8")
+  }
+}
+
+async function listCollections() {
+  const result = await prisma.$runCommandRaw({ listCollections: 1 })
+  return (result?.cursor?.firstBatch || [])
+    .map((collection) => collection?.name)
+    .filter(Boolean)
+    .filter((name) => !name.startsWith("system."))
+}
+
+function hasPrismaModel(schemaContent, modelName) {
+  return new RegExp(`model\\s+${modelName}\\s*\\{`).test(String(schemaContent || ""))
+}
+
+function validateImportSnapshotOrThrow(payload) {
+  const files = payload?.files
+  const database = payload?.database
+  if (!files?.prismaSchema || !files?.serverJs || !Array.isArray(files?.generatedAppDirs)) {
+    throw new Error("Invalid snapshot.files format")
+  }
+  if (!Array.isArray(database?.collections)) {
+    throw new Error("Invalid snapshot.database.collections format")
+  }
+  if (!hasPrismaModel(files.prismaSchema, "User") || !hasPrismaModel(files.prismaSchema, "Config")) {
+    throw new Error("Snapshot schema must contain User and Config models")
+  }
+  const collectionNames = new Set(database.collections.map((c) => c?.name).filter(Boolean))
+  for (const name of SYSTEM_COLLECTIONS) {
+    if (!collectionNames.has(name)) {
+      throw new Error(`Snapshot does not contain required system collection: ${name}`)
+    }
+  }
+}
+
+async function getCollectionDocuments(name) {
+  const result = await prisma.$runCommandRaw({
+    find: name,
+    filter: {},
+  })
+  return result?.cursor?.firstBatch || []
+}
+
+async function dropCollectionIfExists(name) {
+  try {
+    await prisma.$runCommandRaw({ drop: name })
+  } catch (error) {
+    const message = String(error?.message || "").toLowerCase()
+    if (!message.includes("ns not found")) {
+      throw error
+    }
+  }
+}
+
+async function restoreCollection(name, documents) {
+  await dropCollectionIfExists(name)
+  if (!Array.isArray(documents) || documents.length === 0) return
+  await prisma.$runCommandRaw({
+    insert: name,
+    documents,
+  })
+}
 
 function normalizeSlug(raw = "") {
   return String(raw)
@@ -427,4 +544,116 @@ export const createDynamicPage = asyncHandler(async (req, res) => {
   })
 
   res.status(201).json(page)
+})
+
+// @desc    Export full generated snapshot (files + collections)
+// @route   GET /api/admin/data/export
+// @access  Private (Admin only)
+export const exportGeneratedSnapshot = asyncHandler(async (_req, res) => {
+  const generatedDirs = await listGeneratedAppDirs()
+  const generatedAppDirs = []
+  for (const dirName of generatedDirs) {
+    const dirPath = path.join(appDir, dirName)
+    const files = await readFilesRecursively(dirPath)
+    generatedAppDirs.push({ name: dirName, files })
+  }
+
+  const schemaPath = path.join(rootDir, "prisma", "schema.prisma")
+  const serverPath = path.join(rootDir, "server.js")
+  const [schemaContent, serverContent] = await Promise.all([
+    fs.readFile(schemaPath, "utf-8"),
+    fs.readFile(serverPath, "utf-8"),
+  ])
+
+  const collectionNames = await listCollections()
+  const collections = []
+  for (const name of collectionNames) {
+    const documents = await getCollectionDocuments(name)
+    collections.push({ name, documents })
+  }
+
+  res.json({
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    snapshot: {
+      files: {
+        prismaSchema: schemaContent,
+        serverJs: serverContent,
+        generatedAppDirs,
+      },
+      database: {
+        collections,
+      },
+    },
+  })
+})
+
+// @desc    Import full generated snapshot with reset
+// @route   POST /api/admin/data/import
+// @access  Private (Admin only)
+export const importGeneratedSnapshot = asyncHandler(async (req, res) => {
+  const payload = req.body?.snapshot
+  if (!payload || typeof payload !== "object") {
+    res.status(400)
+    throw new Error("snapshot is required")
+  }
+
+  try {
+    validateImportSnapshotOrThrow(payload)
+  } catch (validationError) {
+    res.status(400)
+    throw validationError
+  }
+  const files = payload.files
+  const database = payload.database
+
+  const existingCollections = await listCollections()
+  const existingCollectionSet = new Set(existingCollections)
+  const systemBackup = []
+  for (const name of SYSTEM_COLLECTIONS) {
+    if (!existingCollectionSet.has(name)) continue
+    const docs = await getCollectionDocuments(name)
+    systemBackup.push({ name, documents: docs })
+  }
+
+  const resetScriptPath = path.join(rootDir, "scripts", "reset-generated.mjs")
+  await execFileAsync("node", [resetScriptPath, "--apply"], {
+    cwd: rootDir,
+    maxBuffer: 20 * 1024 * 1024,
+  })
+
+  const currentGeneratedDirs = await listGeneratedAppDirs()
+  for (const dirName of currentGeneratedDirs) {
+    await fs.rm(path.join(appDir, dirName), { recursive: true, force: true })
+  }
+
+  const schemaPath = path.join(rootDir, "prisma", "schema.prisma")
+  const serverPath = path.join(rootDir, "server.js")
+  await fs.writeFile(schemaPath, files.prismaSchema, "utf-8")
+  await fs.writeFile(serverPath, files.serverJs, "utf-8")
+
+  for (const dir of files.generatedAppDirs) {
+    if (!dir?.name || !Array.isArray(dir?.files)) continue
+    if (!/^[a-z0-9_-]+$/i.test(dir.name)) {
+      throw new Error(`Invalid generated dir name: ${dir.name}`)
+    }
+    const dirPath = path.join(appDir, dir.name)
+    await fs.mkdir(dirPath, { recursive: true })
+    await writeSnapshotDir(dirPath, dir.files)
+  }
+
+  for (const collection of database.collections) {
+    if (!collection?.name) continue
+    if (SYSTEM_COLLECTIONS.has(collection.name)) continue
+    await restoreCollection(collection.name, collection.documents || [])
+  }
+
+  for (const collection of systemBackup) {
+    await restoreCollection(collection.name, collection.documents || [])
+  }
+
+  res.json({
+    success: true,
+    message: "Импорт завершен. Все данные и сгенерированные ресурсы заменены.",
+  })
 })

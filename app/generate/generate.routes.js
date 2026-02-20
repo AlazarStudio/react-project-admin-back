@@ -4,7 +4,9 @@ import {
   generateResource,
   getDynamicPage,
   updateDynamicPage,
-  createDynamicPage
+  createDynamicPage,
+  exportGeneratedSnapshot,
+  importGeneratedSnapshot
 } from "./generate.controller.js"
 
 const router = express.Router()
@@ -19,5 +21,13 @@ router
   .get(protect, admin, getDynamicPage)
   .post(protect, admin, createDynamicPage)
   .put(protect, admin, updateDynamicPage)
+
+router
+  .route("/data/export")
+  .get(protect, admin, exportGeneratedSnapshot)
+
+router
+  .route("/data/import")
+  .post(protect, admin, importGeneratedSnapshot)
 
 export default router

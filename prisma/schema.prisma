@@ -1,9 +1,44 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
 generator client {
   provider = "prisma-client-js"
-  output   = "../generated/client"
+  output   = "../generated/client_recovery"
 }
 
 datasource db {
   provider = "mongodb"
   url      = env("DATABASE_URL")
+}
+
+enum Role {
+  SUPERADMIN
+  USER
+}
+
+type UserInformation {
+  firstName String?
+  lastName  String?
+}
+
+model User {
+  id              String           @id @default(auto()) @map("_id") @db.ObjectId
+  createdAt       DateTime         @default(now()) @map("created_at")
+  updatedAt       DateTime         @updatedAt @map("updated_at")
+  email           String           @unique
+  login           String           @unique
+  name            String
+  password        String
+  role            Role             @default(USER)
+  userInformation UserInformation?
+}
+
+model Config {
+  id            String   @id @default(auto()) @map("_id") @db.ObjectId
+  backendApiUrl String?
+  frontendUrl   String?
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  @@map("configs")
 }
