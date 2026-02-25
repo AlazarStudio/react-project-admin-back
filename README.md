@@ -2,6 +2,16 @@
 
 Шаблон для создания REST API на Node.js с Express, Prisma и PostgreSQL.
 
+Создание .env:
+
+JWT_SECRET=your-super-secret-jwt-key-change-this-in-production
+DATABASE_URL="mongodb://localhost:27017,localhost:27018,localhost:27019/alazarstudio_back_site?replicaSet=rs0"
+
+DB_NAME="alazarstudio_back_site"
+
+NODE_ENV="dev"
+PORT=5000
+
 ## Установка
 
 1. Клонируйте репозиторий или используйте как шаблон.
