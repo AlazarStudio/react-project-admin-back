@@ -2,6 +2,7 @@ import fs from "fs"
 import path from "path"
 import asyncHandler from "express-async-handler"
 import multer from "multer"
+import sharp from "sharp"
 
 const uploadsDir = path.resolve("uploads")
 
@@ -38,10 +39,37 @@ export const uploadMedia = asyncHandler(async (req, res) => {
     throw new Error("No file uploaded")
   }
 
+  const isImage = typeof req.file.mimetype === "string" && req.file.mimetype.startsWith("image/")
+  let filename = req.file.filename
+  let url = `/uploads/${filename}`
+  let mimetype = req.file.mimetype
+  let size = req.file.size
+
+  if (isImage) {
+    const inputPath = req.file.path
+    const parsed = path.parse(req.file.filename)
+    const webpFilename = `${parsed.name}.webp`
+    const webpPath = path.join(uploadsDir, webpFilename)
+
+    try {
+      await sharp(inputPath).rotate().webp({ quality: 82 }).toFile(webpPath)
+      fs.unlinkSync(inputPath)
+    } catch (error) {
+      if (fs.existsSync(webpPath)) fs.unlinkSync(webpPath)
+      throw error
+    }
+
+    const stats = fs.statSync(webpPath)
+    filename = webpFilename
+    url = `/uploads/${filename}`
+    mimetype = "image/webp"
+    size = stats.size
+  }
+
   res.status(201).json({
-    url: `/uploads/${req.file.filename}`,
-    filename: req.file.filename,
-    mimetype: req.file.mimetype,
-    size: req.file.size,
+    url,
+    filename,
+    mimetype,
+    size,
   })
 })
