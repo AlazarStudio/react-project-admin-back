@@ -39,13 +39,15 @@ export const uploadMedia = asyncHandler(async (req, res) => {
     throw new Error("No file uploaded")
   }
 
+  const fileExt = path.extname(req.file.filename || "").toLowerCase()
   const isImage = typeof req.file.mimetype === "string" && req.file.mimetype.startsWith("image/")
+  const isAlreadyWebp = req.file.mimetype === "image/webp" || fileExt === ".webp"
   let filename = req.file.filename
   let url = `/uploads/${filename}`
   let mimetype = req.file.mimetype
   let size = req.file.size
 
-  if (isImage) {
+  if (isImage && !isAlreadyWebp) {
     const inputPath = req.file.path
     const parsed = path.parse(req.file.filename)
     const webpFilename = `${parsed.name}.webp`
@@ -54,16 +56,17 @@ export const uploadMedia = asyncHandler(async (req, res) => {
     try {
       await sharp(inputPath).rotate().webp({ quality: 82 }).toFile(webpPath)
       fs.unlinkSync(inputPath)
+      const stats = fs.statSync(webpPath)
+      filename = webpFilename
+      url = `/uploads/${filename}`
+      mimetype = "image/webp"
+      size = stats.size
     } catch (error) {
       if (fs.existsSync(webpPath)) fs.unlinkSync(webpPath)
-      throw error
+      // Если конвертация недоступна для конкретного изображения,
+      // не валим загрузку и оставляем оригинальный файл.
+      console.warn("Image conversion skipped, keeping original file:", error?.message || error)
     }
-
-    const stats = fs.statSync(webpPath)
-    filename = webpFilename
-    url = `/uploads/${filename}`
-    mimetype = "image/webp"
-    size = stats.size
   }
 
   res.status(201).json({
