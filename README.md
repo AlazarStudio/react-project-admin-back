@@ -36,6 +36,17 @@ DATABASE_URL="postgresql://user:password@localhost:5432/dbname?schema=public"
 JWT_SECRET=your-super-secret-jwt-key-change-this-in-production
 ```
 
+Для `production` backend запускается только по HTTPS.
+
+Обязательные переменные для `production`:
+
+```env
+NODE_ENV=production
+# PORT можно не указывать (по умолчанию будет 443)
+SSL_CERT_PATH=/etc/letsencrypt/live/your-domain/fullchain.pem
+SSL_KEY_PATH=/etc/letsencrypt/live/your-domain/privkey.pem
+```
+
 4. Настройте базу данных:
 
 ```bash
