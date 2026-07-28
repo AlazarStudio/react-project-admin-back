@@ -1,0 +1,24 @@
+# Локальная БД админки «Маяк».
+# Порт 5434, потому что 5432 и 5433 на машине уже заняты другими контейнерами.
+#   docker compose up -d
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: mayak-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: mayak
+      POSTGRES_PASSWORD: mayak_local_dev_2026
+      POSTGRES_DB: mayak
+    ports:
+      - "5434:5432"
+    volumes:
+      - mayak-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mayak -d mayak"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  mayak-pgdata:

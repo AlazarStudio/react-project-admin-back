@@ -1,92 +1,94 @@
 import { faker } from "@faker-js/faker"
 import { hash, verify } from "argon2"
+import crypto from "crypto"
 import asyncHandler from "express-async-handler"
 
 import { prisma } from "../prisma.js"
+import { badRequest, httpError } from "../utils/http.utils.js"
 import { UserFields } from "../utils/user.utils.js"
 
 import { generateToken } from "./generate-token.js"
 
+/**
+ * Хеш-заглушка от случайного пароля. Если пользователя нет, всё равно
+ * выполняем полноценную проверку argon2: иначе несуществующий логин отвечает
+ * заметно быстрее существующего и логины можно перебирать по времени ответа.
+ */
+let dummyHashPromise = null
+function getDummyHash() {
+  if (!dummyHashPromise) {
+    dummyHashPromise = hash(crypto.randomBytes(32).toString("hex"))
+  }
+  return dummyHashPromise
+}
+
+// Одно и то же сообщение на «нет такого логина» и «неверный пароль».
+const INVALID_CREDENTIALS = "Invalid login or password"
+
 // @desc    Auth user
 // @route   POST /api/auth/login
-// @access  Public
+// @access  Public (с ограничением частоты)
 export const authUser = asyncHandler(async (req, res) => {
-  const { login, password } = req.body
+  const { login, password } = req.body || {}
 
-  if (!login || !password) {
-    res.status(400)
-    throw new Error("Please provide login and password")
+  if (typeof login !== "string" || typeof password !== "string" || !login || !password) {
+    throw badRequest("Please provide login and password")
   }
 
-  const user = await prisma.user.findUnique({
-    where: {
-      login
-    }
-  })
+  const user = await prisma.user.findUnique({ where: { login } })
 
   if (!user) {
-    res.status(401)
-    throw new Error("Invalid login or password")
+    // Выравниваем время ответа, результат намеренно игнорируем.
+    await verify(await getDummyHash(), password).catch(() => false)
+    throw httpError(401, INVALID_CREDENTIALS)
   }
 
-  const isValidPassword = await verify(user.password, password)
+  const isValidPassword = await verify(user.password, password).catch(() => false)
 
-  if (isValidPassword) {
-    const token = generateToken(user.id)
-    res.json({
-      user: {
-        id: user.id,
-        email: user.email,
-        login: user.login,
-        name: user.name,
-        role: user.role,
-        createdAt: user.createdAt,
-        updatedAt: user.updatedAt
-      },
-      token
-    })
-  } else {
-    res.status(401)
-    throw new Error("Invalid login or password")
+  if (!isValidPassword) {
+    throw httpError(401, INVALID_CREDENTIALS)
   }
+
+  const token = generateToken(user.id)
+  res.json({
+    user: {
+      id: user.id,
+      email: user.email,
+      login: user.login,
+      name: user.name,
+      role: user.role,
+      createdAt: user.createdAt,
+      updatedAt: user.updatedAt
+    },
+    token
+  })
 })
 
-// @desc    Register user
+// @desc    Register user (заводит администратор — публичной регистрации нет)
 // @route   POST /api/auth/register
-// @access  Public
+// @access  Private (Admin)
 export const registerUser = asyncHandler(async (req, res) => {
-  const { login, email, password, name } = req.body
+  const { login, email, password, name, role } = req.body || {}
 
-  if (!login || !email || !password) {
-    res.status(400)
-    throw new Error("Please provide login, email and password")
+  if (typeof login !== "string" || typeof email !== "string" || typeof password !== "string") {
+    throw badRequest("Please provide login, email and password")
   }
 
-  if (password.length < 6) {
-    res.status(400)
-    throw new Error("Password must be at least 6 characters")
+  if (password.length < 8) {
+    throw badRequest("Password must be at least 8 characters")
   }
 
-  const isHaveUser = await prisma.user.findUnique({
-    where: {
-      login
-    }
+  if (role !== undefined && role !== "USER" && role !== "SUPERADMIN") {
+    throw badRequest('role must be "USER" or "SUPERADMIN"')
+  }
+
+  const existing = await prisma.user.findFirst({
+    where: { OR: [{ login }, { email }] },
   })
 
-  if (isHaveUser) {
-    res.status(400)
-    throw new Error("User with this login already exists")
-  }
-
-  const isHaveEmail = await prisma.user.findUnique({
-    where: {
-      email
-    }
-  })
-
-  if (isHaveEmail) {
-    res.status(400)
-    throw new Error("User with this email already exists")
+  // Не уточняем, что именно занято — логин или почта.
+  if (existing) {
+    throw httpError(409, "User with these credentials already exists")
   }
 
   const user = await prisma.user.create({
@@ -94,12 +96,11 @@ export const registerUser = asyncHandler(async (req, res) => {
       login,
       email,
       password: await hash(password),
-      name: name || faker.person.fullName()
+      name: name || faker.person.fullName(),
+      role: role || "USER",
     },
     select: UserFields
   })
 
-  const token = generateToken(user.id)
-
-  res.status(201).json({ user, token })
+  res.status(201).json({ user })
 })

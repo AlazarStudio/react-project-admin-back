@@ -7,7 +7,7 @@ generator client {
 }
 
 datasource db {
-  provider = "mongodb"
+  provider = "postgresql"
   url      = env("DATABASE_URL")
 }
 
@@ -16,13 +16,19 @@ enum Role {
   USER
 }
 
-type UserInformation {
-  firstName String?
-  lastName  String?
+enum LeadStatus {
+  NEW
+  IN_PROGRESS
+  DONE
+  SPAM
 }
 
+// ---------------------------------------------------------------------------
+// Системные модели шаблона
+// ---------------------------------------------------------------------------
+
 model User {
-  id              String           @id @default(auto()) @map("_id") @db.ObjectId
+  id              String           @id @default(cuid())
   createdAt       DateTime         @default(now()) @map("created_at")
   updatedAt       DateTime         @updatedAt @map("updated_at")
   email           String           @unique
@@ -33,12 +39,316 @@ model User {
   userInformation UserInformation?
 }
 
+// Раньше это был встроенный тип MongoDB (type UserInformation).
+// В PostgreSQL встроенных типов нет, поэтому — отдельная таблица 1:1.
+model UserInformation {
+  id        String   @id @default(cuid())
+  firstName String?  @map("first_name")
+  lastName  String?  @map("last_name")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  userId String @unique @map("user_id")
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("user_informations")
+}
+
 model Config {
-  id            String   @id @default(auto()) @map("_id") @db.ObjectId
+  id            String   @id @default(cuid())
   backendApiUrl String?
   frontendUrl   String?
   createdAt     DateTime @default(now()) @map("created_at")
   updatedAt     DateTime @updatedAt @map("updated_at")
 
   @@map("configs")
+}
+
+// ---------------------------------------------------------------------------
+// Контент сайта ООО «Маяк»
+// ---------------------------------------------------------------------------
+
+/// Заявки с сайта (POST /api/leads по x-api-key).
+model Lead {
+  id        String     @id @default(cuid())
+  name      String
+  phone     String
+  comment   String?
+  source    String?
+  page      String?
+  utm       String?
+  ip        String?
+  status    LeadStatus @default(NEW)
+  createdAt DateTime   @default(now()) @map("created_at")
+  updatedAt DateTime   @updatedAt @map("updated_at")
+
+  @@index([status])
+  @@index([createdAt])
+  @@map("leads")
+}
+
+/// Каталог. Поля повторяют тип Product из src/lib/catalog.ts.
+model Product {
+  id            String   @id @default(cuid())
+  slug          String   @unique
+  name          String
+  /// Обложка товара. Её использует весь сайт: карточки каталога, JSON-LD,
+  /// модалка. Обязательна и ВСЕГДА входит в images.
+  image         String
+  /// Все фотографии товара в порядке показа, включая обложку:
+  /// [{ src: string, alt: string }, …].
+  ///
+  /// Тип Json, а не отдельная таблица: массив читается и пишется целиком,
+  /// по отдельным фотографиям не фильтруем и не джойним, а сид и снимок
+  /// остаются простыми. Так же устроен Article.sections.
+  ///
+  /// src — только локальный путь от одного «/»: внешние адреса роняют
+  /// next/image на сайте, пока домены не прописаны в конфиге. Не более 24
+  /// штук, дубликаты по src схлопываются (побеждает первое вхождение вместе
+  /// со своим alt). alt может быть пустым — это легальный приём для
+  /// декоративных изображений. Валидация — app/product/product.controller.js.
+  ///
+  /// ВНИМАНИЕ: jsonb канонизирует порядок ключей внутри объекта; порядок
+  /// самих элементов массива сохраняется. Сравнивать по ключам, не по порядку.
+  images        Json     @default("[]")
+  purpose       String
+  type          String
+  tags          String[]
+  exploitation  String
+  options       String[]
+  size          String
+  individual    Boolean  @default(false)
+  description   String
+  complectation String[]
+  sortOrder     Int      @default(0) @map("sort_order")
+  published     Boolean  @default(true)
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  @@index([sortOrder])
+  // Фактические выборки каталога: публикация + сортировка и фильтры UI.
+  @@index([published, sortOrder])
+  @@index([type])
+  @@index([exploitation])
+  // Фильтры `tags has ...` / `options has ...` — это оператор массива @>,
+  // его обслуживает GIN, а не B-tree.
+  @@index([tags], type: Gin)
+  @@index([options], type: Gin)
+  @@map("products")
+}
+
+/// Блог. Поля повторяют тип BlogArticle из src/lib/blog.ts.
+/// publishedAt/updatedAt — контентные даты (редактируются вручную),
+/// поэтому updatedAt здесь НЕ помечен @updatedAt. Техническая дата — createdAt.
+model Article {
+  id           String   @id @default(cuid())
+  slug         String   @unique
+  title        String
+  description  String
+  excerpt      String
+  image        String
+  imageAlt     String   @map("image_alt")
+  publishedAt  DateTime @map("published_at")
+  updatedAt    DateTime @map("updated_at")
+  readingTime  String   @map("reading_time")
+  keywords     String[]
+  intro        String[]
+  /// Тело статьи — массив блоков ArticleBlock: { id, type, …поля по типу }.
+  /// Десять типов и правила валидации — app/article/article-blocks.js.
+  /// У блока heading есть необязательный level (2 или 3): H1 занят заголовком
+  /// страницы, раздел — H2, подзаголовок — H3. Отсутствие поля означает 2.
+  /// Старый формат { id, title, paragraphs?, bullets?, table? } тоже
+  /// принимается и разворачивается в блоки при записи.
+  sections     Json
+  published    Boolean  @default(true)
+  sortOrder    Int      @default(0) @map("sort_order")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  @@index([publishedAt])
+  // Порядок выдачи блога: orderBy [sortOrder asc, publishedAt desc] c фильтром published.
+  @@index([published, sortOrder, publishedAt])
+  @@map("articles")
+}
+
+/// Направления («Решения по задачам») — SOLUTIONS из src/lib/site.ts.
+/// key — это поле id в исходных данных сайта.
+model Solution {
+  id          String   @id @default(cuid())
+  key         String   @unique
+  icon        String
+  label       String
+  kicker      String
+  title       String
+  description String
+  bullets     String[]
+  sortOrder   Int      @default(0) @map("sort_order")
+  published   Boolean  @default(true)
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  products SolutionProduct[]
+
+  @@index([sortOrder])
+  @@index([published, sortOrder])
+  @@map("solutions")
+}
+
+/// Товары-примеры направления — SOLUTION_PRODUCTS из src/lib/site.ts.
+model SolutionProduct {
+  id        String   @id @default(cuid())
+  name      String
+  image     String
+  sortOrder Int      @default(0) @map("sort_order")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  solutionId String   @map("solution_id")
+  solution   Solution @relation(fields: [solutionId], references: [id], onDelete: Cascade)
+
+  // Естественный ключ позиции внутри направления: сид и PUT делают по нему
+  // upsert, поэтому id существующих записей не меняются при каждом сохранении.
+  @@unique([solutionId, name])
+  @@index([solutionId, sortOrder])
+  @@map("solution_products")
+}
+
+/// Единственная строка настроек сайта — CONTACTS из src/lib/site.ts.
+model SiteSetting {
+  id String @id @default(cuid())
+  /// Технический флаг: уникальное поле с единственным допустимым значением
+  /// физически запрещает появление второй строки настроек.
+  singleton Boolean  @default(true) @unique
+  phones    String[]
+  telegram  String?
+  max       String?
+  email     String?
+  address   String?
+
+  // --- Счётчики аналитики -------------------------------------------------
+  /// Номер счётчика Яндекс.Метрики: только цифры, до 12 знаков («98765432»).
+  yandexMetrikaId   String? @map("yandex_metrika_id")
+  /// Идентификатор потока GA4 вида «G-XXXXXXXXXX». Хранится в верхнем регистре.
+  googleAnalyticsId String? @map("google_analytics_id")
+
+  // --- Доставка заявок ----------------------------------------------------
+  /// Получатели уведомлений о заявке: [{ chatId: string, label: string }, …].
+  /// Порядок сохраняется, дубликаты по chatId схлопываются (побеждает первое
+  /// вхождение), не более 20 получателей. Пустой массив = в Telegram не шлём.
+  ///
+  /// chatId ИМЕННО строка: у групп id отрицательный и длинный, у каналов
+  /// начинается с «-100», в Int такое не влезает. Допускается и «@username».
+  ///
+  /// Тип Json по тем же причинам, что и Product.images: читается и пишется
+  /// целиком, по отдельным получателям не фильтруем. Помним, что jsonb
+  /// канонизирует порядок ключей внутри объекта (порядок элементов массива
+  /// сохраняется точно).
+  leadTelegramChats Json @default("[]") @map("lead_telegram_chats")
+
+  /// УСТАРЕЛО. Одиночный получатель — остался запасным вариантом на время
+  /// рассинхрона выкатки фронта и бэкенда. Порядок выбора при доставке:
+  /// leadTelegramChats (если непуст) -> leadTelegramChatId -> переменная
+  /// окружения. Новый код должен писать только в leadTelegramChats.
+  leadTelegramChatId String? @map("lead_telegram_chat_id")
+
+  /// Адрес для уведомлений о заявках.
+  leadEmail          String? @map("lead_email")
+
+  // --- robots.txt ---------------------------------------------------------
+  /// Главный выключатель индексации. false — сайт целиком закрывается
+  /// от поисковиков. По умолчанию индексация разрешена.
+  robotsIndexing Boolean  @default(true) @map("robots_indexing")
+
+  /// Дополнительные запрещённые пути, которые задаёт владелец: «/lp-test»,
+  /// «/old/» и т.п. Каждый — путь от «/», без пробелов, до 200 символов,
+  /// не более 50 штук, дубликаты схлопываются.
+  ///
+  /// ВАЖНО: служебные запреты сайта (/api/, /admin, /konfigurator) здесь
+  /// НЕ хранятся и через панель не редактируются — они зашиты в коде сайта,
+  /// чтобы не зависеть от содержимого базы. Менять их — правка кода, а не данных.
+  robotsDisallow String[] @default([]) @map("robots_disallow")
+
+  // ВНИМАНИЕ: токен Telegram-бота здесь СОЗНАТЕЛЬНО отсутствует и не должен
+  // появиться. Он живёт в .env сайта: база уезжает в резервные копии, а токен
+  // — секрет, дающий полный доступ к боту. Ни одно поле выше секретом не является.
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("site_settings")
+}
+
+/// Цифры доверия — STATS из src/lib/site.ts.
+model Stat {
+  id        String   @id @default(cuid())
+  value     String
+  label     String
+  icon      String
+  sortOrder Int      @default(0) @map("sort_order")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([sortOrder])
+  @@map("stats")
+}
+
+/// Этапы «От задачи — до результата» — PROCESS из src/lib/site.ts.
+model ProcessStep {
+  id        String   @id @default(cuid())
+  n         String
+  title     String
+  sortOrder Int      @default(0) @map("sort_order")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([sortOrder])
+  @@map("process_steps")
+}
+
+/// Частые вопросы — FAQ_ITEMS из src/lib/faq.ts.
+/// В исходниках сайта поля называются коротко (q/a); здесь — question/answer,
+/// потому что имена колонок читает человек в панели. Сопоставление делает
+/// scripts/export-seed-data.mjs при сборке снимка.
+model FaqItem {
+  id        String   @id @default(cuid())
+  /// Текст вопроса, до 300 символов.
+  question  String
+  /// Текст ответа, до 2000 символов.
+  answer    String
+  sortOrder Int      @default(0) @map("sort_order")
+  /// Снятый с публикации вопрос не показывается на сайте нигде.
+  /// Главнее showOnHome: published = false убирает вопрос отовсюду.
+  published Boolean  @default(true)
+  /// Показывать ли вопрос в коротком блоке на главной странице.
+  /// published = true + showOnHome = false — вопрос виден на /faq,
+  /// но на главную не попадает. По умолчанию true, чтобы миграция
+  /// ничего не убрала с сайта.
+  ///
+  /// API по этому полю НЕ фильтрует: сайт получает список целиком и решает
+  /// сам (на главной блок короткий, на /faq полный) — лишний параметр
+  /// запроса только мешал бы кэшированию.
+  showOnHome Boolean @default(true) @map("show_on_home")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([sortOrder])
+  @@index([published, sortOrder])
+  @@map("faq_items")
+}
+
+/// Загруженные через /api/media/upload файлы.
+model Media {
+  id        String   @id @default(cuid())
+  filename  String
+  url       String   @unique
+  mimeType  String   @map("mime_type")
+  /// BigInt: Int (int4) переполняется уже на 2 ГБ.
+  size      BigInt
+  width     Int?
+  height    Int?
+  alt       String?
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([createdAt])
+  @@map("media")
 }

@@ -44,7 +44,20 @@ export const updateUserProfile = asyncHandler(async (req, res) => {
     }
     updateData.password = await hash(password)
   }
-  if (userInformation) updateData.userInformation = userInformation
+  // userInformation переехал из встроенного типа Mongo в отдельную таблицу,
+  // поэтому пишем его вложенным upsert'ом.
+  if (userInformation && typeof userInformation === "object") {
+    const info = {}
+    if (userInformation.firstName !== undefined) info.firstName = userInformation.firstName || null
+    if (userInformation.lastName !== undefined) info.lastName = userInformation.lastName || null
+
+    updateData.userInformation = {
+      upsert: {
+        create: info,
+        update: info
+      }
+    }
+  }
 
   const updatedUser = await prisma.user.update({
     where: {
